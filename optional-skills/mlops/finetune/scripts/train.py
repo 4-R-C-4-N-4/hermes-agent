@@ -229,6 +229,26 @@ class TrainingOrchestrator:
         train_env["AXOLOTL_DO_NOT_TRACK"] = "1"
         train_env["DO_NOT_TRACK"] = "1"
 
+        # Reduce CUDA allocator fragmentation. On 12GB cards with an active
+        # desktop session, the difference between fitting and OOMing often
+        # comes down to fragmentation rather than absolute memory usage.
+        # PyTorch's expandable_segments allocator coalesces freed regions
+        # so a large eval-time allocation (~3-4 GiB for the LoRA kernel
+        # workspace) doesn't fail on a fragmented heap.
+        if "PYTORCH_CUDA_ALLOC_CONF" not in train_env:
+            train_env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+        # Persist Triton autotune results across runs. Models with custom
+        # attention layers (e.g. Qwen3.5's gated delta rule via the FLA
+        # library) trigger Triton kernel autotuning on the first backward
+        # pass — the autotuner allocates several launch configurations
+        # back-to-back, which on tight VRAM can OOM even when steady-state
+        # training would fit. Caching the autotune results to disk means
+        # subsequent runs reuse the chosen kernel config and skip the
+        # bench-driven OOM prone phase entirely. The cache lives at
+        # ~/.triton/cache by default.
+        train_env.setdefault("TRITON_CACHE_AUTOTUNING", "1")
+
         logger.info("Launching training: %s", " ".join(cmd))
         logger.info("Log: %s", log_path)
 
