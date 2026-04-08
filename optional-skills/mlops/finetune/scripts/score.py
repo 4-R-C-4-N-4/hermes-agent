@@ -52,6 +52,19 @@ CONCLUSION_PATTERNS = [
     re.compile(r"\ball\s+(set|good|done)\b", re.I),
 ]
 
+# Patterns where the user is demanding the assistant actually use a tool
+# instead of just answering from memory. Used by positive_no_tool_response
+# to penalize no-tool turns that the user rejected.
+TOOL_DEMAND_PATTERNS = [
+    re.compile(r"\b(actually|please)\s+(use|run|call|execute|invoke)\s+", re.I),
+    re.compile(r"\buse\s+(the|a)\s+tool\b", re.I),
+    re.compile(r"\b(run|execute|invoke)\s+(the|it|that)\b", re.I),
+    re.compile(r"\bcheck\s+(it|the\s+(file|code|repo|actual))", re.I),
+    re.compile(r"\b(read|grep|search|look\s+at)\s+the\s+(file|code|repo|source)", re.I),
+    re.compile(r"\bdon'?t\s+(guess|assume|make\s+(it|that)\s+up)\b", re.I),
+    re.compile(r"\bstop\s+guessing\b", re.I),
+]
+
 # ── Sentiment lexicon ──
 
 POSITIVE_WORDS = {
@@ -594,6 +607,79 @@ def positive_efficiency_modifier(
     return 0.0
 
 
+# === Signal 6: Good no-tool response ===
+#
+# Rebalances the training set against tool-call dominance: rewards assistant
+# turns that correctly chose NOT to call a tool. Without this signal the
+# scorer treats every no-tool turn as 0.5 (neutral), so the trained adapter
+# drifts toward "always call a tool" — which regressed no_tool_accuracy and
+# canary_pass_rate by ~18% in v19. See finetune-no-tool-rebalance notes.
+
+def positive_no_tool_response(
+    turns: List[Dict],
+    assistant_idx: int,
+) -> Optional[float]:
+    """
+    Score an assistant turn that didn't call any tools, based on whether
+    the user accepted the answer.
+
+    Returns None if the turn DID call tools (let other signals handle it),
+    or if the assistant turn has no real content. Otherwise returns a
+    score in [0.0, 0.95]:
+
+      - 0.0  if the user explicitly demanded a tool / corrected the answer
+      - 0.4  if the user followed up with new constraints (ambiguous)
+      - 0.6  if this is the final turn (can't confirm acceptance)
+      - 0.8  if the user moved on without rejecting (implicit accept)
+      - 0.9  if the user explicitly affirmed (thanks/perfect/etc.)
+    """
+    turn = turns[assistant_idx]
+    if turn.get("tool_calls"):
+        return None
+
+    content = turn.get("content") or ""
+    if isinstance(content, list):
+        content = " ".join(str(c) for c in content)
+    if len(str(content).strip()) < 20:
+        # Empty/trivial replies aren't a meaningful "chose not to call a tool"
+        return None
+
+    # Find the next user turn
+    next_user = None
+    for j in range(assistant_idx + 1, len(turns)):
+        if turns[j].get("role") == "user":
+            next_user = turns[j]
+            break
+
+    if next_user is None:
+        return 0.6  # last turn — can't confirm, but don't penalize
+
+    next_content = next_user.get("content") or ""
+    if isinstance(next_content, list):
+        next_content = " ".join(str(c) for c in next_content)
+
+    # Hard reject: user demanded a tool or corrected
+    if any(p.search(next_content) for p in TOOL_DEMAND_PATTERNS):
+        return 0.0
+    if any(p.search(next_content) for p in CORRECTION_PATTERNS):
+        return 0.0
+
+    # Soft signal: user added new constraints (long, substantive follow-up)
+    # — answer was likely incomplete but not wrong
+    word_count = len(next_content.split())
+    if word_count >= 25:
+        return 0.4
+
+    # Explicit affirmation
+    if any(p.search(next_content) for p in AFFIRMATION_PATTERNS):
+        return 0.9
+    if any(p.search(next_content) for p in CONCLUSION_PATTERNS):
+        return 0.9
+
+    # Implicit accept: short follow-up that moves on
+    return 0.8
+
+
 class QualityScorer:
     """Score session quality using heuristic signals."""
 
@@ -899,6 +985,10 @@ class QualityScorer:
 
                 if i in velocity_scores:
                     signals.append(velocity_scores[i])
+
+                ntr = positive_no_tool_response(turns, i)
+                if ntr is not None and ntr > 0:
+                    signals.append(ntr)
 
                 if signals:
                     base = max(signals)

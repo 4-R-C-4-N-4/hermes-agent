@@ -1059,6 +1059,84 @@ class TestPositiveSignals:
         ]
         assert detect_resolution(turns) is None
 
+    # ---- No-tool response (Signal 6) ----
+
+    def test_no_tool_response_user_accepts(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "what's the difference between a list and a tuple in python"),
+            self._turn("assistant", "Lists are mutable, tuples are immutable. Tuples are also "
+                                    "hashable so they can be used as dict keys."),
+            self._turn("user", "thanks, perfect"),
+        ]
+        score = positive_no_tool_response(turns, 1)
+        assert score is not None and score >= 0.85
+
+    def test_no_tool_response_user_demands_tool(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "what does main.py do"),
+            self._turn("assistant", "It probably defines a main function and prints something."),
+            self._turn("user", "actually read the file and tell me"),
+        ]
+        score = positive_no_tool_response(turns, 1)
+        assert score == 0.0
+
+    def test_no_tool_response_user_corrects(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "what's 2 + 2"),
+            self._turn("assistant", "The answer is 5, here's a longer explanation about it"),
+            self._turn("user", "no, that's wrong"),
+        ]
+        score = positive_no_tool_response(turns, 1)
+        assert score == 0.0
+
+    def test_no_tool_response_skipped_for_tool_call(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "list files"),
+            self._turn("assistant", "Looking", tool_calls=[
+                {"function": {"name": "terminal", "arguments": '{"cmd": "ls"}'}}
+            ]),
+            self._turn("user", "thanks"),
+        ]
+        # Tool turn — let other signals handle it
+        assert positive_no_tool_response(turns, 1) is None
+
+    def test_no_tool_response_user_adds_constraints(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "explain decorators"),
+            self._turn("assistant", "A decorator is a function that wraps another function "
+                                    "to extend its behavior without modifying it."),
+            self._turn("user", "okay but I specifically need to know how to write one that "
+                               "takes arguments and preserves the wrapped function's signature "
+                               "and also works with async functions"),
+        ]
+        score = positive_no_tool_response(turns, 1)
+        # New constraints → ambiguous (0.4), not full credit
+        assert score == 0.4
+
+    def test_no_tool_response_final_turn(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "what's the capital of france"),
+            self._turn("assistant", "The capital of France is Paris."),
+        ]
+        score = positive_no_tool_response(turns, 1)
+        assert score == 0.6
+
+    def test_no_tool_response_skips_trivial_content(self, tmp_hermes):
+        from score import positive_no_tool_response
+        turns = [
+            self._turn("user", "ok"),
+            self._turn("assistant", "ok"),
+            self._turn("user", "thanks"),
+        ]
+        # Below 20-char threshold — not a meaningful no-tool decision
+        assert positive_no_tool_response(turns, 1) is None
+
     # ---- End-to-end scoring with the new mode ----
 
     def test_score_session_positive_mode_with_tool_success(self, tmp_hermes):
